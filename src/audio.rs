@@ -41,7 +41,7 @@ impl AudioRenderer {
     }
 }
 
-pub struct AudioOut {
+struct AudioOut {
     renderer: AudioRenderer,
 }
 
