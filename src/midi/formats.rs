@@ -33,9 +33,24 @@ pub struct Smf {
 }
 
 impl Smf {
-    fn open<P: AsRef<Path>>(path: P) -> Result<Self, ParseError> {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ParseError> {
         let mut file_buffer = BufReader::new(File::open(path)?);
         Self::read(&mut file_buffer)
+    }
+
+    /// microseconds
+    ///
+    /// [time-division-of-a-midi-file](https://www.recordingblogs.com/wiki/time-division-of-a-midi-file)
+    pub fn timebase(&self) -> usize {
+        let division = self.header.division;
+        let default_tempo: usize = 500_000;
+        if division > 0 {
+            default_tempo / division as usize
+        } else {
+            let fps = ((division >> 8) & 0x7F) as usize;
+            let tpf = (division & 0x00FF) as usize;
+            1_000_000 / (fps * tpf)
+        }
     }
 }
 
@@ -45,7 +60,10 @@ pub struct HeaderChunk {
     header_len: u32,
     format: Format,
     track_num: u16,
-    timebase: i16,
+    /// if division > 0: Pulses per quarter note
+    ///
+    /// else: Or Frames per second
+    division: i16,
 }
 
 #[derive(Debug)]
@@ -78,43 +96,84 @@ pub struct TrackEvent {
 pub struct U28(u32);
 
 #[derive(Debug)]
-pub enum EventKind {
-    Meta {
-        meta_type: MetaType,
-        data_len: U28,
-        data: Vec<u8>,
-    },
-    Midi {
-        channel: u8,
-        msg: MidiMessage,
-    },
-    Sysex {
-        data_len: U28,
-        data: Vec<u8>,
-    },
+pub struct Slice(Vec<u8>);
+
+impl Slice {
+    fn to_ascii_str(self) -> String {
+        self.0
+            .into_iter()
+            .map(|c| {
+                #[inline]
+                fn hexify(b: u8) -> u8 {
+                    match b {
+                        0..=9 => b'0' + b,
+                        _ => b'a' + b - 10,
+                    }
+                }
+
+                let (data, len) = match c {
+                    b'\t' => ([b'\\', b't', 0, 0], 2),
+                    b'\r' => ([b'\\', b'r', 0, 0], 2),
+                    b'\n' => ([b'\\', b'n', 0, 0], 2),
+                    b'\\' => ([b'\\', b'\\', 0, 0], 2),
+                    b'\'' => ([b'\\', b'\'', 0, 0], 2),
+                    b'"' => ([b'\\', b'"', 0, 0], 2),
+                    b'\x20'..=b'\x7e' => ([c, 0, 0, 0], 1),
+                    _ => ([b'\\', b'x', hexify(c >> 4), hexify(c & 0xf)], 4),
+                };
+
+                unsafe { String::from_utf8_unchecked(Vec::from(&data[0..len])) }
+            })
+            .collect::<String>()
+    }
+
+    fn to_u32(self) -> u32 {
+        let mut num = 0u32;
+        let nums = self.0;
+        for i in 0..4 {
+            if let Some(n) = nums.get(i) {
+                num <<= 8;
+                num += *n as u32;
+            }
+        }
+        num
+    }
 }
 
 #[derive(Debug)]
-pub enum MetaType {
-    TrackNumber,
-    Text,
-    Copyright,
-    TrackName,
-    InstrumentName,
-    Lyric,
-    Marker,
-    CuePoint,
-    ProgramName,
-    DeviceName,
-    MidiChannel,
-    MidiPort,
+pub enum EventKind {
+    Meta { msg: MetaMessage },
+    Midi { channel: u8, msg: MidiMessage },
+    Sysex { msg: Slice },
+}
+
+#[derive(Debug)]
+pub enum MetaMessage {
+    SequenceNumber(Slice),
+    Text(String),
+    Copyright(String),
+    TrackName(String),
+    InstrumentName(String),
+    Lyric(String),
+    Marker(String),
+    CuePoint(String),
+    ChannelPrefix(Slice),
     EndOfTrack,
-    Tempo,
-    SmpteOffset,
-    TimeSignature,
-    KeySignature,
-    SequencerSpecific,
-    Unknown,
+    /// value 0x07A120 (500000 decimal) means that there are 500,000 microseconds per quarter note.
+    ///
+    /// Since there are 60,000,000 microseconds per minute,
+    ///
+    /// the message above translates to:
+    ///
+    /// set the tempo to 60,000,000 / 500,000 = 120 quarter notes per minute (120 beats per minute).
+    ///
+    /// [midi-set-tempo-meta-message](https://www.recordingblogs.com/wiki/midi-set-tempo-meta-message)
+    Tempo(u32),
+    SmpteOffset(Slice),
+    TimeSignature(Slice),
+    KeySignature(Slice),
+    SequencerSpecific(Slice),
+    Unknown(Slice),
 }
 
 #[derive(Debug)]
@@ -188,7 +247,7 @@ impl ByteChunk for HeaderChunk {
             header_len: u32::read(buf)?,
             format: Format::read(buf)?,
             track_num: u16::read(buf)?,
-            timebase: i16::read(buf)?,
+            division: i16::read(buf)?,
         })
     }
 }
@@ -212,8 +271,21 @@ impl ByteChunk for TrackChunk {
             track_len: u32::read(buf)?,
             track_events: {
                 let mut events = Vec::<TrackEvent>::new();
-                while let Ok(te) = TrackEvent::read(buf) {
-                    events.push(te);
+                while let Ok(track_event) = TrackEvent::read(buf) {
+                    match &track_event.event {
+                        EventKind::Meta { msg } => match msg {
+                            MetaMessage::EndOfTrack => {
+                                events.push(track_event);
+                                break;
+                            }
+                            _ => {
+                                events.push(track_event);
+                            }
+                        },
+                        _ => {
+                            events.push(track_event);
+                        }
+                    }
                 }
                 events
             },
@@ -250,9 +322,9 @@ impl ByteChunk for U28 {
             inner <<= 7;
             if u_8 >= 0x80 {
                 u_8 &= 0x7F;
-                inner += u_8 as u32;
+                inner += u32::from(u_8);
             } else {
-                inner += u_8 as u32;
+                inner += u32::from(u_8);
                 break;
             }
         }
@@ -260,29 +332,34 @@ impl ByteChunk for U28 {
     }
 }
 
-impl ByteChunk for MetaType {
+impl ByteChunk for Slice {
     fn read<B: BufRead>(buf: &mut B) -> Result<Self, ParseError> {
-        let u_8 = u8::read(buf)?;
-        Ok(match u_8 {
-            0x00 => Self::TrackNumber,
-            0x01 => Self::Text,
-            0x02 => Self::Copyright,
-            0x03 => Self::TrackName,
-            0x04 => Self::InstrumentName,
-            0x05 => Self::Lyric,
-            0x06 => Self::Marker,
-            0x07 => Self::CuePoint,
-            0x08 => Self::ProgramName,
-            0x09 => Self::DeviceName,
-            0x20 => Self::MidiChannel,
-            0x21 => Self::MidiPort,
+        let data_len = U28::read(buf)?;
+        let mut slice = vec![0u8; data_len.0 as usize];
+        buf.read(slice.as_mut())?;
+        Ok(Self(slice))
+    }
+}
+
+impl ByteChunk for MetaMessage {
+    fn read<B: BufRead>(buf: &mut B) -> Result<Self, ParseError> {
+        Ok(match u8::read(buf)? {
+            0x00 => Self::SequenceNumber(Slice::read(buf)?),
+            0x01 => Self::Text(Slice::read(buf)?.to_ascii_str()),
+            0x02 => Self::Copyright(Slice::read(buf)?.to_ascii_str()),
+            0x03 => Self::TrackName(Slice::read(buf)?.to_ascii_str()),
+            0x04 => Self::InstrumentName(Slice::read(buf)?.to_ascii_str()),
+            0x05 => Self::Lyric(Slice::read(buf)?.to_ascii_str()),
+            0x06 => Self::Marker(Slice::read(buf)?.to_ascii_str()),
+            0x07 => Self::CuePoint(Slice::read(buf)?.to_ascii_str()),
+            0x20 => Self::ChannelPrefix(Slice::read(buf)?),
             0x2F => Self::EndOfTrack,
-            0x51 => Self::Tempo,
-            0x54 => Self::SmpteOffset,
-            0x58 => Self::TimeSignature,
-            0x59 => Self::KeySignature,
-            0x7F => Self::SequencerSpecific,
-            _ => Self::Unknown,
+            0x51 => Self::Tempo(Slice::read(buf)?.to_u32()),
+            0x54 => Self::SmpteOffset(Slice::read(buf)?),
+            0x58 => Self::TimeSignature(Slice::read(buf)?),
+            0x59 => Self::KeySignature(Slice::read(buf)?),
+            0x7F => Self::SequencerSpecific(Slice::read(buf)?),
+            _ => Self::Unknown(Slice::read(buf)?),
         })
     }
 }
@@ -342,23 +419,12 @@ impl ByteChunk for EventKind {
                 },
             },
             0xF => match low {
-                0x0 | 0x7 => {
-                    let data_len = U28::read(buf)?;
-                    let mut data = vec![0; data_len.0 as usize];
-                    buf.read(data.as_mut())?;
-                    Self::Sysex { data_len, data }
-                }
-                0xF => {
-                    let meta_type = MetaType::read(buf)?;
-                    let data_len = U28::read(buf)?;
-                    let mut data = vec![0; data_len.0 as usize];
-                    buf.read(data.as_mut())?;
-                    Self::Meta {
-                        meta_type,
-                        data_len,
-                        data,
-                    }
-                }
+                0x0 | 0x7 => Self::Sysex {
+                    msg: Slice::read(buf)?,
+                },
+                0xF => Self::Meta {
+                    msg: MetaMessage::read(buf)?,
+                },
                 _ => Err(ParseError::NotSupportedSystemMessage(high))?,
             },
             _ => Err(ParseError::NotCommand(high))?,
@@ -368,7 +434,10 @@ impl ByteChunk for EventKind {
 
 #[cfg(test)]
 mod midi_tests {
-    use std::io::{BufReader, Read};
+    use std::{
+        fmt::Debug,
+        io::{BufReader, Read, Write},
+    };
 
     use super::*;
 
@@ -376,9 +445,18 @@ mod midi_tests {
         BufReader::new(bytes)
     }
 
+    #[allow(unused)]
+    fn write_log<T: Debug>(any: T) {
+        let mut file = File::create("0.log").unwrap();
+        write!(file, "{:#?}", any).unwrap();
+    }
+
     #[test]
     fn parse() {
-        let _ = Smf::open("null.mid").unwrap();
+        let Smf { header, tracks } = Smf::open("test.mid").unwrap();
+        // write_log(tracks);
+        assert_eq!(format!("{:?}", header.tag), String::from("Header"));
+        assert_eq!(format!("{:?}", tracks.tag), String::from("Track"));
     }
 
     #[test]
@@ -389,6 +467,21 @@ mod midi_tests {
         let mut bytes = get_buf([0x81u8, 0x7f, 0xff].as_ref());
         let U28(inner) = U28::read(&mut bytes).unwrap();
         assert_eq!(inner, 255);
+    }
+
+    #[test]
+    fn slice_to_string() {
+        let ascii = br"abcdef ghijklmnop";
+        let ascii_vec = Vec::from(&ascii[..]);
+        let ascii_str = String::from("abcdef ghijklmnop");
+        assert_eq!(Slice(ascii_vec).to_ascii_str(), ascii_str);
+    }
+
+    #[test]
+    fn slice_to_u32() {
+        let nums = [0x07u8, 0xA1, 0x20];
+        let nums_vec = Vec::from(&nums[..]);
+        assert_eq!(Slice(nums_vec).to_u32(), 500000)
     }
 
     #[test]

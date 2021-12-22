@@ -3,6 +3,7 @@ mod controller;
 mod envelope;
 mod filter;
 mod midi;
-mod oscillator;
+mod mix;
+mod osc;
 
 fn main() {}

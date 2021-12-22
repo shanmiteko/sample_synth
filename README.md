@@ -29,6 +29,7 @@ $ cargo build --release
 * [Frame](https://alsa.opensrc.org/Frame)
 * [PCM / WAV 格式](https://www.cnblogs.com/renhui/p/12148330.html)
 * [What-is-MIDI](https://www.instructables.com/What-is-MIDI/)
+* [musical-instrument-digital-interface-midi](https://www.recordingblogs.com/wiki/musical-instrument-digital-interface-midi)
 * [MIDI文件格式解析](https://www.jianshu.com/p/59d74800b43b)
 * [Outline of the Standard MIDI File Structure](http://www.ccarh.org/courses/253/handout/smf/)
 * [MIDI Communication Protocol](http://www.ccarh.org/courses/253/handout/midiprotocol/)

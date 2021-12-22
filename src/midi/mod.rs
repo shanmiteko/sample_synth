@@ -1,4 +1,3 @@
-mod formats;
-mod reader;
-
-pub use formats::Smf;
+pub mod control;
+pub mod formats;
+pub mod player;

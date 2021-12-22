@@ -37,7 +37,6 @@ impl AudioRenderer {
         for s in buffer.iter_mut() {
             *s = S::from::<f32>(&0.0);
         }
-        todo!()
     }
 }
 
